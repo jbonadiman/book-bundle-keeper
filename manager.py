@@ -4,6 +4,15 @@ import re
 import sqlite3
 from pathlib import Path
 
+from postgrest import AsyncPostgrestClient  # type: ignore
+
+
+class WebService:
+    def __init__(self, host: str, table: str, token: str):
+        self.host = host
+        self.table = table
+        self.token = token
+
 
 class Book:
     def __init__(self, title: str, bundle: str):
@@ -23,7 +32,7 @@ class Book:
         return hash((self.title, self.bundle))
 
 
-def _get_db_cursor(db_path: Path) -> sqlite3.Cursor:
+def _get_sqlite_cursor(db_path: Path) -> sqlite3.Cursor:
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     return c
@@ -54,8 +63,8 @@ def read_file(file_path: Path) -> list[Book] | None:
     return book_list
 
 
-def write_to_db(db_path: Path, *books: Book) -> None:
-    cursor = _get_db_cursor(db_path)
+def write_to_sqlite(db_path: Path, *books: Book) -> None:
+    cursor = _get_sqlite_cursor(db_path)
 
     cursor.execute('''CREATE TABLE IF NOT EXISTS books
              (title text, bundle text, unique(title))''')
@@ -88,3 +97,32 @@ def write_to_db(db_path: Path, *books: Book) -> None:
 
     cursor.connection.commit()
     cursor.connection.close()
+
+
+async def write_to_postgrest(psgrst_service: WebService, *books: Book) -> None:
+    async with AsyncPostgrestClient(psgrst_service.host,
+                                    headers={'Authorization': f'Bearer {psgrst_service.token}'}) as client:
+        for book in books:
+            title, bundle = (book.title, book.bundle)
+            title_without_edition = title.split(', ')[0]
+
+            result = await client \
+                .from_(psgrst_service.table) \
+                .select('id, title') \
+                .ilike('title', f'{title_without_edition}*') \
+                .execute()
+
+            if result.data:
+                if title > result.data[0]['title']:
+                    # update the book with the new bundle
+                    await client \
+                        .from_(psgrst_service.table) \
+                        .update({'title': title, 'bundle': bundle}) \
+                        .eq('id', result.data[0]['id']) \
+                        .execute()
+            else:
+                # insert the new book
+                await client \
+                    .from_(psgrst_service.table) \
+                    .insert({'title': title, 'bundle': bundle}) \
+                    .execute()
